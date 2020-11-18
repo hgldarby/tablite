@@ -12,6 +12,8 @@ def test_datatype_inference():
     assert DataTypes.infer('-1', int) == -1
     assert DataTypes.infer('"1000028"', int) == 1000028
     assert DataTypes.infer('"1,000,028"', int) == 1000028
+    assert DataTypes.infer('"1.028"', int) == 1028
+    assert DataTypes.infer('1.999.999', int) == 1999999
 
     # floats
     assert DataTypes.infer("2932,500", float) == 2932.5
