@@ -1,6 +1,9 @@
 from table import *
 from datetime import date, time, datetime
+from itertools import count
 import zlib
+import pyperclip
+
 
 
 def test_basic_column():
@@ -200,6 +203,56 @@ def test_basic_table():
     assert table5 == table5_from_json
 
 
+def test_add_rows():
+    """ Example from docstring. """
+    t = Table()
+    t.add_column('test', int)
+    t.add_column('A', int)
+    t.add_column('B', int)
+    t.add_column('C', int)
+    test_number = count(1)
+
+    # The following examples are all valid and append the row (1,2,3) to the table.
+
+    t.add_row(next(test_number), 1, 2, 3)
+    t.add_row([next(test_number), 1, 2, 3])
+    t.add_row((next(test_number), 1, 2, 3))
+    t.add_row(*(next(test_number), 1, 2, 3))
+    t.add_row(test=next(test_number), A=1, B=2, C=3)
+    t.add_row(**{'test': next(test_number), 'A': 1, 'B': 2, 'C': 3})
+
+    # The following examples add two rows to the table
+
+    t.add_row((next(test_number), 1, 2, 3), (next(test_number), 4, 5, 6))
+    t.add_row([next(test_number), 1, 2, 3], [next(test_number), 4, 5, 6])
+    t.add_row({'test': next(test_number), 'A': 1, 'B': 2, 'C': 3},
+              {'test': next(test_number), 'A': 4, 'B': 5, 'C': 6})  # two (or more) dicts as args.
+    t.add_row(*[{'test': next(test_number), 'A': 1, 'B': 2, 'C': 3},
+                {'test': next(test_number), 'A': 1, 'B': 2, 'C': 3}])  # list of dicts.
+    t.show()  # expects:
+    # +=====+=====+=====+=====+
+    # | test|  A  |  B  |  C  |
+    # | int | int | int | int |
+    # |False|False|False|False|
+    # +-----+-----+-----+-----+
+    # |    1|    1|    2|    3|
+    # |    2|    1|    2|    3|
+    # |    3|    1|    2|    3|
+    # |    4|    1|    2|    3|
+    # |    5|    1|    2|    3|
+    # |    6|    1|    2|    3|
+    # |    7|    1|    2|    3|
+    # |    8|    4|    5|    6|
+    # |    9|    1|    2|    3|
+    # |   10|    4|    5|    6|
+    # |   11|    1|    2|    3|
+    # |   12|    4|    5|    6|
+    # |   13|    1|    2|    3|
+    # |   14|    1|    2|    3|
+    # +=====+=====+=====+=====+
+    assert next(test_number) == 14 + 1
+
+
 def test_lookup_functions():  # doing lookups is supported by indexing:
     table6 = Table()
     table6.add_column('A', str, data=['Alice', 'Bob', 'Bob', 'Ben', 'Charlie', 'Ben', 'Albert'])
@@ -214,28 +267,79 @@ def test_lookup_functions():  # doing lookups is supported by indexing:
 
 def test_sql_joins():  # a couple of examples with SQL join:
 
-    left = Table()
-    left.add_column('number', int, allow_empty=True, data=[1, 2, 3, 4, None])
-    left.add_column('colour', str, data=['black', 'blue', 'white', 'white', 'blue'])
+    numbers = Table()
+    numbers.add_column('number', int, allow_empty=True, data=[1, 2, 3, 4, None])
+    numbers.add_column('colour', str, data=['black', 'blue', 'white', 'white', 'blue'])
 
-    right = Table()
-    right.add_column('letter', str, allow_empty=True, data=['a', 'b', 'c', 'd', None])
-    right.add_column('colour', str, data=['blue', 'white', 'orange', 'white', 'blue'])
+    letters = Table()
+    letters.add_column('letter', str, allow_empty=True, data=['a', 'b', 'c', 'd', None])
+    letters.add_column('color', str, data=['blue', 'white', 'orange', 'white', 'blue'])
 
     # left join
-    # SELECT number, letter FROM left LEFT JOIN right on left.colour == right.colour
-    left_join = left.left_join(right, keys=['colour'], columns=['number', 'letter'])
+    # SELECT number, letter FROM numbers LEFT JOIN letters ON numbers.colour == letters.color
+    left_join = numbers.left_join(letters, left_keys=['colour'], right_keys=['color'], columns=['number', 'letter'])
     left_join.show()
+    # +======+======+
+    # |number|letter|
+    # | int  | str  |
+    # | True | True |
+    # +------+------+
+    # |     1|None  |
+    # |     2|a     |
+    # |     2|None  |
+    # |     3|b     |
+    # |     3|d     |
+    # |     4|b     |
+    # |     4|d     |
+    # |None  |a     |
+    # |None  |None  |
+    # +======+======+
+    assert [i for i in left_join['number']] == [1, 2, 2, 3, 3, 4, 4, None, None]
+    assert [i for i in left_join['letter']] == [None, 'a', None, 'b', 'd', 'b', 'd', 'a', None]
 
     # inner join
-    # SELECT number, letter FROM left JOIN right ON left.colour == right.colour
-    inner_join = left.inner_join(right, keys=['colour'], columns=['number', 'letter'])
+    # SELECT number, letter FROM numbers JOIN letters ON numbers.colour == letters.color
+    inner_join = numbers.inner_join(letters, left_keys=['colour'], right_keys=['color'], columns=['number', 'letter'])
     inner_join.show()
+    # +======+======+
+    # |number|letter|
+    # | int  | str  |
+    # | True | True |
+    # +------+------+
+    # |     2|a     |
+    # |     2|None  |
+    # |None  |a     |
+    # |None  |None  |
+    # |     3|b     |
+    # |     3|d     |
+    # |     4|b     |
+    # |     4|d     |
+    # +======+======+
+    assert [i for i in inner_join['number']] == [2, 2, None, None, 3, 3, 4, 4]
+    assert [i for i in inner_join['letter']] == ['a', None, 'a', None, 'b', 'd', 'b', 'd']
 
     # outer join
-    # SELECT number, letter FROM left OUTER JOIN right ON left.colour == right.colour
-    outer_join = left.outer_join(right, keys=['colour'], columns=['number', 'letter'])
+    # SELECT number, letter FROM numbers OUTER JOIN letters ON numbers.colour == letters.color
+    outer_join = numbers.outer_join(letters, left_keys=['colour'], right_keys=['color'], columns=['number', 'letter'])
     outer_join.show()
+    # +======+======+
+    # |number|letter|
+    # | int  | str  |
+    # | True | True |
+    # +------+------+
+    # |     1|None  |
+    # |     2|a     |
+    # |     2|None  |
+    # |     3|b     |
+    # |     3|d     |
+    # |     4|b     |
+    # |     4|d     |
+    # |None  |a     |
+    # |None  |None  |
+    # |None  |c     |
+    # +======+======+
+    assert [i for i in outer_join['number']] == [1, 2, 2, 3, 3, 4, 4, None, None, None]
+    assert [i for i in outer_join['letter']] == [None, 'a', None, 'b', 'd', 'b', 'd', 'a', None, 'c']
 
     assert left_join != inner_join
     assert inner_join != outer_join
@@ -270,4 +374,20 @@ def test_sortation():  # Sortation
     assert list(table7.filter('A', 'B', slice(4, 8))) == [(1, 10), (5, 10), (9, 10), (7, 10)]
 
     assert table7.is_sorted(**sort_order)
+
+
+def test_clipboard():
+    t = Table()
+    t.add_column('dog', int, data=[1, 4])
+    t.add_column('cat', int, data=[2, 5])
+    t.add_column('hat', int, data=[3, 6])
+    t.show()
+    try:
+        t.copy_to_clipboard()
+        t2 = t.copy_from_clipboard()
+        assert t == t2
+    except pyperclip.PyperclipException:
+        pass  # travis VMs can't handle this.
+
+
 

@@ -198,29 +198,79 @@ def test_lookup_functions():  # doing lookups is supported by indexing:
 
 
 def test_sql_joins():  # a couple of examples with SQL join:
+    numbers = Table(use_disk=True)
+    numbers.add_column('number', int, allow_empty=True, data=[1, 2, 3, 4, None])
+    numbers.add_column('colour', str, data=['black', 'blue', 'white', 'white', 'blue'])
 
-    left = Table(use_disk=True)
-    left.add_column('number', int, allow_empty=True, data=[1, 2, 3, 4, None])
-    left.add_column('colour', str, data=['black', 'blue', 'white', 'white', 'blue'])
-
-    right = Table(use_disk=True)
-    right.add_column('letter', str, allow_empty=True, data=['a', 'b', 'c', 'd', None])
-    right.add_column('colour', str, data=['blue', 'white', 'orange', 'white', 'blue'])
+    letters = Table(use_disk=True)
+    letters.add_column('letter', str, allow_empty=True, data=['a', 'b', 'c', 'd', None])
+    letters.add_column('color', str, data=['blue', 'white', 'orange', 'white', 'blue'])
 
     # left join
-    # SELECT number, letter FROM left LEFT JOIN right on left.colour == right.colour
-    left_join = left.left_join(right, keys=['colour'], columns=['number', 'letter'])
+    # SELECT number, letter FROM numbers LEFT JOIN letters ON numbers.colour == letters.color
+    left_join = numbers.left_join(letters, left_keys=['colour'], right_keys=['color'], columns=['number', 'letter'])
     left_join.show()
+    # +======+======+
+    # |number|letter|
+    # | int  | str  |
+    # | True | True |
+    # +------+------+
+    # |     1|None  |
+    # |     2|a     |
+    # |     2|None  |
+    # |     3|b     |
+    # |     3|d     |
+    # |     4|b     |
+    # |     4|d     |
+    # |None  |a     |
+    # |None  |None  |
+    # +======+======+
+    assert [i for i in left_join['number']] == [1, 2, 2, 3, 3, 4, 4, None, None]
+    assert [i for i in left_join['letter']] == [None, 'a', None, 'b', 'd', 'b', 'd', 'a', None]
 
     # inner join
-    # SELECT number, letter FROM left JOIN right ON left.colour == right.colour
-    inner_join = left.inner_join(right, keys=['colour'], columns=['number', 'letter'])
+    # SELECT number, letter FROM numbers JOIN letters ON numbers.colour == letters.color
+    inner_join = numbers.inner_join(letters, left_keys=['colour'], right_keys=['color'], columns=['number', 'letter'])
     inner_join.show()
+    # +======+======+
+    # |number|letter|
+    # | int  | str  |
+    # | True | True |
+    # +------+------+
+    # |     2|a     |
+    # |     2|None  |
+    # |None  |a     |
+    # |None  |None  |
+    # |     3|b     |
+    # |     3|d     |
+    # |     4|b     |
+    # |     4|d     |
+    # +======+======+
+    assert [i for i in inner_join['number']] == [2, 2, None, None, 3, 3, 4, 4]
+    assert [i for i in inner_join['letter']] == ['a', None, 'a', None, 'b', 'd', 'b', 'd']
 
     # outer join
-    # SELECT number, letter FROM left OUTER JOIN right ON left.colour == right.colour
-    outer_join = left.outer_join(right, keys=['colour'], columns=['number', 'letter'])
+    # SELECT number, letter FROM numbers OUTER JOIN letters ON numbers.colour == letters.color
+    outer_join = numbers.outer_join(letters, left_keys=['colour'], right_keys=['color'], columns=['number', 'letter'])
     outer_join.show()
+    # +======+======+
+    # |number|letter|
+    # | int  | str  |
+    # | True | True |
+    # +------+------+
+    # |     1|None  |
+    # |     2|a     |
+    # |     2|None  |
+    # |     3|b     |
+    # |     3|d     |
+    # |     4|b     |
+    # |     4|d     |
+    # |None  |a     |
+    # |None  |None  |
+    # |None  |c     |
+    # +======+======+
+    assert [i for i in outer_join['number']] == [1, 2, 2, 3, 3, 4, 4, None, None, None]
+    assert [i for i in outer_join['letter']] == [None, 'a', None, 'b', 'd', 'b', 'd', 'a', None, 'c']
 
     assert left_join != inner_join
     assert inner_join != outer_join
@@ -255,4 +305,93 @@ def test_sortation():  # Sortation
     assert list(table7.filter('A', 'B', slice(4, 8))) == [(1, 10), (5, 10), (9, 10), (7, 10)]
 
     assert table7.is_sorted(**sort_order)
+
+
+def test_recreate_readme_comparison():
+    try:
+        import os
+        import psutil
+    except ImportError:
+        return
+    process = psutil.Process(os.getpid())
+    baseline_memory = process.memory_info().rss
+    from time import process_time
+
+    from table import Table
+
+    digits = 1_000_000
+
+    records = Table()
+    records.add_column('method', str)
+    records.add_column('memory', int)
+    records.add_column('time', float)
+
+    records.add_row(('python', baseline_memory, 0.0))
+
+    # Let's now use the common and convenient "row" based format:
+
+    start = process_time()
+    L = []
+    for _ in range(digits):
+        L.append(tuple([11 for _ in range(10)]))
+    end = process_time()
+
+    # go and check taskmanagers memory usage.
+    # At this point we're using ~154.2 Mb to store 1 million lists with 10 items.
+    records.add_row(('1e6 lists w. 10 integers', process.memory_info().rss - baseline_memory, round(end-start,4)))
+
+    L.clear()
+
+    # Let's now use a columnar format instead:
+    start = process_time()
+    L = [[11 for i in range(digits)] for _ in range(10)]
+    end = process_time()
+
+    # go and check taskmanagers memory usage.
+    # at this point we're using ~98.2 Mb to store 10 lists with 1 million items.
+    records.add_row(('10 lists with 1e6 integers', process.memory_info().rss - baseline_memory, round(end-start,4)))
+    L.clear()
+
+    # We've thereby saved 50 Mb by avoiding the overhead from managing 1 million lists.
+
+    # Q: But why didn't I just use an array? It would have even lower memory footprint.
+    # A: First, array's don't handle None's and we get that frequently in dirty csv data.
+    # Second, Table needs even less memory.
+
+    # Let's start with an array:
+
+    import array
+    start = process_time()
+    L = [array.array('i', [11 for _ in range(digits)]) for _ in range(10)]
+    end = process_time()
+    # go and check taskmanagers memory usage.
+    # at this point we're using 60.0 Mb to store 10 lists with 1 million integers.
+
+    records.add_row(('10 lists with 1e6 integers in arrays', process.memory_info().rss - baseline_memory, round(end-start,4)))
+    L.clear()
+
+    # Now let's use Table:
+
+    start = process_time()
+    t = Table()
+    for i in range(10):
+        t.add_column(str(i), int, allow_empty=False, data=[11 for _ in range(digits)])
+    end = process_time()
+
+    records.add_row(('Table with 10 columns with 1e6 integers', process.memory_info().rss - baseline_memory, round(end-start,4)))
+
+    # go and check taskmanagers memory usage.
+    # At this point we're using  97.5 Mb to store 10 columns with 1 million integers.
+
+    # Next we'll use the api `use_stored_lists` to drop to disk:
+    start = process_time()
+    t.use_disk = True
+    end = process_time()
+    records.add_row(('Table on disk with 10 columns with 1e6 integers', process.memory_info().rss - baseline_memory, round(end-start,4)))
+
+    # go and check taskmanagers memory usage.
+    # At this point we're using  24.5 Mb to store 10 columns with 1 million integers.
+    # Only the metadata remains in pythons memory.
+
+    records.show()
 

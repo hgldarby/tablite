@@ -1,4 +1,5 @@
 import json
+import pyperclip
 import pickle
 from itertools import count
 from collections import defaultdict
@@ -659,6 +660,18 @@ class Record(object):
         del self.buffer[key]
 
 
+def windows_tempfile(prefix='tmp', suffix='.db'):
+    """ generates a safe tempfile which windows can't handle. """
+    safe_folder = Path(gettempdir())
+    while 1:
+        n = "".join(choice(ascii_lowercase) for _ in range(5))
+        name = f"{prefix}{n}{suffix}"
+        p = safe_folder / name
+        if not p.exists():
+            break
+    return p
+
+
 class Buffer(object):
     """ internal storage class of the StoredList
 
@@ -675,8 +688,8 @@ class Buffer(object):
     sql_select = "SELECT data FROM records WHERE id=?"
 
     def __init__(self):
-        self.file = self.windows_tempfile()
-        self._conn = sqlite3.connect(self.file)  # SQLite3 connection
+        self.file = windows_tempfile()
+        self._conn = sqlite3.connect(str(self.file))  # SQLite3 connection
         with self._conn as c:
             c.execute(self.sql_create)
             c.execute(self.sql_journal_off)
@@ -689,17 +702,6 @@ class Buffer(object):
             self._conn.interrupt()
             self._conn.close()
         self.file.unlink()
-
-    def windows_tempfile(self, prefix='tmp', suffix='.db'):
-        """ generates a safe tempfile which windows can't handle. """
-        safe_folder = Path(gettempdir())
-        while 1:
-            n = "".join(choice(ascii_lowercase) for _ in range(5))
-            name = f"{prefix}{n}{suffix}"
-            p = safe_folder / name
-            if not p.exists():
-                break
-        return p
 
     def buffer_update(self, record):
         assert isinstance(record, Record)
@@ -1336,6 +1338,28 @@ class Table(object):
             variation = f"(except {', '.join([f'{k}({v})' for k, v in lengths.items() if v < longest_col])})"
         return f"{self.__class__.__name__}() # {len(self.columns)} columns x {len(self)} rows {variation}"
 
+    def copy_to_clipboard(self):
+        """ copy data from a Table into clipboard. """
+        try:
+            s = ["\t".join([f"{name}" for name in self.columns])]
+            for row in self.rows:
+                s.append("\t".join((str(i) for i in row)))
+            s = "\n".join(s)
+            pyperclip.copy(s)
+        except MemoryError:
+            raise MemoryError("Cannot copy to clipboard. Select slice instead.")
+
+    @staticmethod
+    def copy_from_clipboard():
+        """ copy data from clipboard into Table. """
+        tempfile = windows_tempfile(suffix='.csv')
+        with open(tempfile, 'w') as fo:
+            fo.writelines(pyperclip.paste())
+        g = Table.from_file(tempfile)
+        t = list(g)[0]
+        del t.metadata['filename']
+        return t
+
     def show(self, *items):
         """ shows the table.
         param: items: column names, slice.
@@ -1411,6 +1435,16 @@ class Table(object):
         for table in file_reader(path, **kwargs):
             yield table
 
+    @staticmethod
+    def copy_columns_only(table):
+        """creates a new table without the data"""
+        assert isinstance(table, Table)
+        t = Table()
+        for col in table.columns.values():
+            t.add_column(col.header, col.datatype, col.allow_empty, data=[])
+        t.metadata = table.metadata.copy()
+        return t
+
     def check_for_duplicate_header(self, header):
         assert isinstance(header, str)
         if not header:
@@ -1429,13 +1463,82 @@ class Table(object):
         else:
             self.columns[header] = StoredColumn(header, datatype, allow_empty, data=data)
 
-    def add_row(self, values):
-        if not isinstance(values, tuple):
-            raise TypeError(f"expected tuple, got {type(values)}")
-        if len(values) != len(self.columns):
-            raise ValueError(f"expected {len(self.columns)} values not {len(values)}: {values}")
-        for value, col in zip(values, self.columns.values()):
-            col.append(value)
+    def add_row(self, *args, **kwargs):
+        """ Adds row(s) to the table.
+        :param args: see below
+        :param kwargs: see below
+        :return: None
+
+        Example:
+
+            t = Table()
+            t.add_column('A', int)
+            t.add_column('B', int)
+            t.add_column('C', int)
+
+        The following examples are all valid and append the row (1,2,3) to the table.
+
+            t.add_row(1,2,3)
+            t.add_row([1,2,3])
+            t.add_row((1,2,3))
+            t.add_row(*(1,2,3))
+            t.add_row(A=1, B=2, C=3)
+            t.add_row(**{'A':1, 'B':2, 'C':3})
+
+        The following examples add two rows to the table
+
+            t.add_row((1,2,3), (4,5,6))
+            t.add_row([1,2,3], [4,5,6])
+            t.add_row({'A':1, 'B':2, 'C':3}, {'A':4, 'B':5, 'C':6}) # two (or more) dicts as args.
+            t.add_row([{'A':1, 'B':2, 'C':3}, {'A':1, 'B':2, 'C':3}]) # list of dicts.
+
+        """
+        if args:
+            if not any(isinstance(i, (list, tuple, dict)) for i in args):
+                if len(args) == len(self.columns):
+                    args = (args, )
+                elif len(args) < len(self.columns):
+                    raise TypeError(f"{args} doesn't match the number of columns. Are values missing?")
+                elif len(args) > len(self.columns):
+                    raise TypeError(f"{args} doesn't match the number of columns. Too many values?")
+                else:
+                    raise TypeError(f"{args} doesn't match the format of the table.")
+
+            for arg in args:
+                if len(arg) != len(self.columns):
+                    raise ValueError(f"expected {len(self.columns)} columns, not {len(arg)}: {arg}")
+
+                if isinstance(arg, (list, tuple)):
+                    for value, col in zip(arg, self.columns.values()):
+                        col.append(value)
+
+                elif isinstance(arg, dict):
+                    for k, value in arg.items():
+                        col = self.columns.get(k, None)
+                        if col is None:
+                            raise ValueError(f"column {k} unknown: {list(self.columns)}")
+                        assert isinstance(col, (Column, StoredColumn))
+                        col.append(value)
+                else:
+                    raise TypeError(f"no handler for {type(arg)}s: {arg}")
+
+        if kwargs:
+            if len(kwargs) < len(self.columns):
+                missing = [k for k in kwargs if k not in self.columns]
+                raise ValueError(f"expected {len(self.columns)} columns, not {len(kwargs)}: Missing columns: {missing}")
+            elif len(kwargs) > len(self.columns):
+                excess = [k for k in kwargs if k not in self.columns]
+                raise ValueError(f"expected {len(self.columns)} columns, not {len(kwargs)}: Excess columns: {excess}")
+            else:
+                pass  # looks alright.
+
+            for k, value in kwargs.items():
+                col = self.columns.get(k, None)
+                if col is None:
+                    raise ValueError(f"column {k} unknown: {list(self.columns)}")
+                assert isinstance(col, (Column, StoredColumn))
+                col.append(value)
+            return
 
     def __contains__(self, item):
         return item in self.columns
@@ -1692,29 +1795,50 @@ class Table(object):
             t.add_column(col.header, col.datatype, col.allow_empty, data=[col[ix] for ix in ixs])
         return t
 
-    def _join_type_check(self, other, keys, columns):
+    def _join_type_check(self, other, left_keys, right_keys, columns):
         if not isinstance(other, Table):
             raise TypeError(f"other expected other to be type Table, not {type(other)}")
-        if not isinstance(keys, list) and all(isinstance(k, str) for k in keys):
-            raise TypeError(f"Expected keys as list of strings, not {type(keys)}")
-        union = list(self.columns) + list(other.columns)
-        if not all(k in self.columns and k in other.columns for k in keys):
-            raise ValueError(f"key(s) not found: {[k for k in keys if k not in union]}")
-        if not all(k in union for k in columns):
-            raise ValueError(f"column(s) not found: {[k for k in keys if k not in union]}")
 
-    def left_join(self, other, keys, columns):
+        if len(left_keys) != len(right_keys):
+            raise ValueError(f"Keys do not have same length: \n{left_keys}, \n{right_keys}")
+
+        if not isinstance(left_keys, list) and all(isinstance(k, str) for k in left_keys):
+            raise TypeError(f"Expected keys as list of strings, not {type(left_keys)}")
+        if not isinstance(right_keys, list) and all(isinstance(k, str) for k in right_keys):
+            raise TypeError(f"Expected keys as list of strings, not {type(right_keys)}")
+
+        if any(key not in self.columns for key in left_keys):
+            raise ValueError(f"left key(s) not found: {[k for k in left_keys if k not in self.columns]}")
+        if any(key not in other.columns for key in right_keys):
+            raise ValueError(f"right key(s) not found: {[k for k in right_keys if k not in other.columns]}")
+        for L, R in zip(left_keys, right_keys):
+            Lcol, Rcol = self.columns[L], other.columns[R]
+            if Lcol.datatype != Rcol.datatype:
+                raise TypeError(f"{L} is {Lcol.datatype}, but {R} is {Rcol.datatype}")
+
+        if columns is None:
+            pass
+        else:
+            union = list(self.columns) + list(other.columns)
+            if any(column not in union for column in columns):
+                raise ValueError(f"Column not found: {[column for column in columns if column not in union]}")
+
+    def left_join(self, other, left_keys, right_keys, columns=None):
         """
         :param other: self, other = (left, right)
-        :param keys: list of keys for the join
-        :param columns: list of columns to retain
+        :param left_keys: list of keys for the join
+        :param right_keys: list of keys for the join
+        :param columns: list of columns to retain, if None, all are retained.
         :return: new table
 
         Example:
-        SQL:   SELECT number, letter FROM left LEFT JOIN right on left.colour == right.colour
-        Table: left_join = left_table.left_join(right_table, keys=['colour'], columns=['number', 'letter'])
+        SQL:   SELECT number, letter FROM numbers LEFT JOIN letters ON numbers.colour == letters.color
+        Table: left_join = numbers.left_join(letters, left_keys=['colour'], right_keys=['color'], columns=['number', 'letter'])
         """
-        self._join_type_check(other, keys, columns)  # raises if error
+        if columns is None:
+            columns = list(self.columns) + list(other.columns)
+
+        self._join_type_check(other, left_keys, right_keys, columns)  # raises if error
 
         left_join = Table(use_disk=self._use_disk)
         for col_name in columns:
@@ -1727,10 +1851,10 @@ class Table(object):
             left_join.add_column(col_name, col.datatype, allow_empty=True)
 
         left_ixs = range(len(self))
-        right_idx = other.index(*keys)
+        right_idx = other.index(*right_keys)
 
         for left_ix in left_ixs:
-            key = tuple(self[h][left_ix] for h in keys)
+            key = tuple(self[h][left_ix] for h in left_keys)
             right_ixs = right_idx.get(key, (None,))
             for right_ix in right_ixs:
                 for col_name, column in left_join.columns.items():
@@ -1745,18 +1869,22 @@ class Table(object):
                         raise Exception('bad logic')
         return left_join
 
-    def inner_join(self, other, keys, columns):
+    def inner_join(self, other, left_keys, right_keys, columns=None):
         """
-        :param other: table
-        :param keys: list of keys
-        :param columns: list of columns to retain
-        :return: new Table
+        :param other: self, other = (left, right)
+        :param left_keys: list of keys for the join
+        :param right_keys: list of keys for the join
+        :param columns: list of columns to retain, if None, all are retained.
+        :return: new table
 
         Example:
-        SQL:   SELECT number, letter FROM left INNER JOIN right ON left.colour == right.colour
-        Table: inner_join = left_table.inner_join_with(right_table, keys=['colour'],  columns=['number','letter'])
+        SQL:   SELECT number, letter FROM numbers JOIN letters ON numbers.colour == letters.color
+        Table: inner_join = numbers.inner_join(letters, left_keys=['colour'], right_keys=['color'], columns=['number', 'letter'])
         """
-        self._join_type_check(other, keys, columns)  # raises if error
+        if columns is None:
+            columns = list(self.columns) + list(other.columns)
+
+        self._join_type_check(other, left_keys, right_keys, columns)  # raises if error
 
         inner_join = Table(use_disk=self._use_disk)
         for col_name in columns:
@@ -1768,12 +1896,12 @@ class Table(object):
                 raise ValueError(f"column name '{col_name}' not in any table.")
             inner_join.add_column(col_name, col.datatype, allow_empty=True)
 
-        key_union = set(self.filter(*keys)).intersection(set(other.filter(*keys)))
+        key_union = set(self.filter(*left_keys)).intersection(set(other.filter(*right_keys)))
 
-        left_ixs = self.index(*keys)
-        right_ixs = other.index(*keys)
+        left_ixs = self.index(*left_keys)
+        right_ixs = other.index(*right_keys)
 
-        for key in key_union:
+        for key in sorted(key_union):
             for left_ix in left_ixs.get(key, set()):
                 for right_ix in right_ixs.get(key, set()):
                     for col_name, column in inner_join.columns.items():
@@ -1782,21 +1910,25 @@ class Table(object):
                         elif col_name in other:
                             column.append(other[col_name][right_ix])
                         else:
-                            raise Exception("bad logic.")
+                            raise ValueError(f"column {col_name} not found. Duplicate names?")
         return inner_join
 
-    def outer_join(self, other, keys, columns):
+    def outer_join(self, other, left_keys, right_keys, columns=None):
         """
-        :param other: table
-        :param keys: list of keys
-        :param columns: list of columns to retain
-        :return: new Table
+        :param other: self, other = (left, right)
+        :param left_keys: list of keys for the join
+        :param right_keys: list of keys for the join
+        :param columns: list of columns to retain, if None, all are retained.
+        :return: new table
 
         Example:
-        SQL:   SELECT number, letter FROM left OUTER JOIN right ON left.colour == right.colour
-        Table: outer_join = left_table.outer_join(right_table, keys=['colour'], columns=['number','letter'])
+        SQL:   SELECT number, letter FROM numbers OUTER JOIN letters ON numbers.colour == letters.color
+        Table: outer_join = numbers.outer_join(letters, left_keys=['colour'], right_keys=['color'], columns=['number', 'letter'])
         """
-        self._join_type_check(other, keys, columns)  # raises if error
+        if columns is None:
+            columns = list(self.columns) + list(other.columns)
+
+        self._join_type_check(other, left_keys, right_keys, columns)  # raises if error
 
         outer_join = Table(use_disk=self._use_disk)
         for col_name in columns:
@@ -1809,11 +1941,11 @@ class Table(object):
             outer_join.add_column(col_name, col.datatype, allow_empty=True)
 
         left_ixs = range(len(self))
-        right_idx = other.index(*keys)
+        right_idx = other.index(*right_keys)
         right_keyset = set(right_idx)
 
         for left_ix in left_ixs:
-            key = tuple(self[h][left_ix] for h in keys)
+            key = tuple(self[h][left_ix] for h in left_keys)
             right_ixs = right_idx.get(key, (None,))
             right_keyset.discard(key)
             for right_ix in right_ixs:
@@ -1840,6 +1972,25 @@ class Table(object):
         return outer_join
 
     def groupby(self, keys, functions):
+        """
+        :param keys: headers for grouping
+        :param functions: list of headers and functions.
+        :return: GroupBy class
+
+        Example usage:
+            from table import Table
+
+            t = Table()
+            t.add_column('date', int, allow_empty=False, data=[1,1,1,2,2,2])
+            t.add_column('sku', int, allow_empty=False, data=[1,2,3,1,2,3])
+            t.add_column('qty', int, allow_empty=False, data=[4,5,4,5,3,7])
+
+            from table import GroupBy, Sum
+
+            g = t.groupby(keys=['sku'], functions=[('qty', Sum)])
+            g.table.show()
+
+        """
         g = GroupBy(keys=keys, functions=functions)
         g += self
         return g
@@ -1885,14 +2036,18 @@ class Sum(Limit):
 
 
 class First(GroupbyFunction):
+    empty = (None, )
+    # we will never receive a tuple, so using (None,) as the initial
+    # value will assure that IF None is the first value, then it can
+    # be captured correctly.
+
     def __init__(self, datatype):
         super().__init__(datatype)
-        self.value = None
+        self.value = self.empty
 
     def update(self, value):
-        if self.value is None:
-            if value is not None:
-                self.value = value
+        if self.value is First.empty:
+            self.value = value
 
 
 class Last(GroupbyFunction):
@@ -1901,8 +2056,7 @@ class Last(GroupbyFunction):
         self.value = None
 
     def update(self, value):
-        if value is not None:
-            self.value = value
+        self.value = value
 
 
 class Count(GroupbyFunction):
@@ -1911,19 +2065,18 @@ class Count(GroupbyFunction):
         self.value = 0
 
     def update(self, value):
-        if value is not None:
-            self.value += 1
+        self.value += 1
 
 
 class CountUnique(GroupbyFunction):
     def __init__(self, datatype):
         super().__init__(datatype=int)  # datatype will be int no matter what type is given.
         self.items = set()
+        self.value = None
 
     def update(self, value):
-        if value is not None:
-            self.items.add(value)
-            self.value = len(self.items)
+        self.items.add(value)
+        self.value = len(self.items)
 
 
 class Average(GroupbyFunction):
@@ -1941,6 +2094,10 @@ class Average(GroupbyFunction):
 
 
 class StandardDeviation(GroupbyFunction):
+    """
+    Uses J.P. Welfords (1962) algorithm.
+    For details see https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Online_algorithm
+    """
     def __init__(self, datatype):
         super().__init__(datatype=float)  # datatype will be float no matter what type is given.
         self.count = 0
@@ -1968,8 +2125,7 @@ class Histogram(GroupbyFunction):
         self.hist = defaultdict(int)
 
     def update(self, value):
-        if value is not None:
-            self.hist[value] += 1
+        self.hist[value] += 1
 
 
 class Median(Histogram):
@@ -1999,55 +2155,105 @@ class Mode(Histogram):
 
 
 class GroupBy(object):
-    functions = [
+    max = Max  # shortcuts to avoid having to type a long list of imports.
+    min = Min
+    sum = Sum
+    first = First
+    last = Last
+    count = Count
+    count_unique = CountUnique
+    avg = Average
+    stdev = StandardDeviation
+    median = Median
+    mode = Mode
+
+    _functions = [
         Max, Min, Sum, First, Last,
         Count, CountUnique,
         Average, StandardDeviation, Median, Mode
     ]
-    function_names = {f.__name__: f for f in functions}
+    _function_names = {f.__name__: f for f in _functions}
 
     def __init__(self, keys, functions):
         """
         :param keys: headers for grouping
         :param functions: list of headers and functions.
         :return: None.
+
+        Example usage:
+        --------------------
+        from table import Table
+
+        t = Table()
+        t.add_column('date', int, allow_empty=False, data=[1,1,1,2,2,2])
+        t.add_column('sku', int, allow_empty=False, data=[1,2,3,1,2,3])
+        t.add_column('qty', int, allow_empty=False, data=[4,5,4,5,3,7])
+
+        from table import GroupBy, Sum
+
+        g = GroupBy(keys=['sku'], functions=[('qty', Sum)])
+        g += t
+        g.table.show()
+
         """
-        assert isinstance(keys, list)
-        assert len(set(keys)) == len(keys), "duplicate key found."
+        if not isinstance(keys, list):
+            raise TypeError(f"Expected keys as a list of header names, not {type(keys)}")
+
+        if len(set(keys)) != len(keys):
+            duplicates = [k for k in keys if keys.count(k) > 1]
+            s = "" if len(duplicates) > 1 else "s"
+            raise ValueError(f"duplicate key{s} found: {duplicates}")
+
         self.keys = keys
 
-        assert isinstance(functions, list)
-        assert all(len(i) == 2 for i in functions)
-        assert all(isinstance(a, str) and issubclass(b, GroupbyFunction) for a, b in functions)
+        if not isinstance(functions, list):
+            raise TypeError(f"Expected functions to be a list of tuples. Got {type(functions)}")
+
+        if not all(len(i) == 2 for i in functions):
+            raise ValueError(f"Expected each tuple in functions to be of length 2. \nGot {functions}")
+
+        if not all(isinstance(a, str) for a, b in functions):
+            L = [(a, type(a)) for a, b in functions if not isinstance(a, str)]
+            raise ValueError(f"Expected header names in functions to be strings. Found: {L}")
+
+        if not all(issubclass(b, GroupbyFunction) and b in GroupBy._functions for a, b in functions):
+            L = [b for a, b in functions if b not in GroupBy._functions]
+            if len(L) == 1:
+                singular = f"function {L[0]} is not in GroupBy.functions"
+                raise ValueError(singular)
+            else:
+                plural = f"the functions {L} are not in GroupBy.functions"
+                raise ValueError(plural)
+
         self.groupby_functions = functions  # list with header name and function name
 
-        self.output = None   # class Table.
-        self.required_headers = None  # headers for reading input.
+        self._output = None   # class Table.
+        self._required_headers = None  # headers for reading input.
         self.data = defaultdict(list)  # key: [list of groupby functions]
-        self.function_classes = []  # initiated functions.
+        self._function_classes = []  # initiated functions.
 
         # Order is preserved so that this is doable:
         # for header, function, function_instances in zip(self.groupby_functions, self.function_classes) ....
 
-    def setup(self, table):
+    def _setup(self, table):
         """ helper to setup the group functions """
-        self.output = Table()
-        self.required_headers = self.keys + [h for h, fn in self.groupby_functions]
+        self._output = Table()
+        self._required_headers = self.keys + [h for h, fn in self.groupby_functions]
 
         for h in self.keys:
             col = table[h]
-            self.output.add_column(header=h, datatype=col.datatype, allow_empty=False)  # add column for keys
+            self._output.add_column(header=h, datatype=col.datatype, allow_empty=True)  # add column for keys
 
-        self.function_classes = []
+        self._function_classes = []
         for h, fn in self.groupby_functions:
             col = table[h]
             assert isinstance(col, Column)
             f_instance = fn(col.datatype)
             assert isinstance(f_instance, GroupbyFunction)
-            self.function_classes.append(f_instance)
+            self._function_classes.append(f_instance)
 
             function_name = f"{fn.__name__}({h})"
-            self.output.add_column(header=function_name, datatype=f_instance.datatype, allow_empty=True)  # add column for fn's.
+            self._output.add_column(header=function_name, datatype=f_instance.datatype, allow_empty=True)  # add column for fn's.
 
     def __iadd__(self, other):
         """
@@ -2055,17 +2261,17 @@ class GroupBy(object):
         To add more data use self += new data (Table)
         """
         assert isinstance(other, Table)
-        if self.output is None:
-            self.setup(other)
+        if self._output is None:
+            self._setup(other)
         else:
-            self.output.compare(other)  # this will raise if there are problems
+            self._output.compare(other)  # this will raise if there are problems
 
-        for row in other.filter(*self.required_headers):
-            d = {h: v for h, v in zip(self.required_headers, row)}
+        for row in other.filter(*self._required_headers):
+            d = {h: v for h, v in zip(self._required_headers, row)}
             key = tuple([d[k] for k in self.keys])
             functions = self.data.get(key)
             if not functions:
-                functions = [fn.__class__(fn.datatype) for fn in self.function_classes]
+                functions = [fn.__class__(fn.datatype) for fn in self._function_classes]
                 self.data[key] = functions
 
             for (h, fn), f in zip(self.groupby_functions, functions):
@@ -2076,33 +2282,33 @@ class GroupBy(object):
         """ helper that generates the result for .table and .rows """
         for key, functions in self.data.items():
             row = key + tuple(fn.value for fn in functions)
-            self.output.add_row(row)
+            self._output.add_row(row)
         self.data.clear()  # hereby we only create the table once.
-        self.output.sort(**{k: False for k in self.keys})
+        self._output.sort(**{k: False for k in self.keys})
 
     @property
     def table(self):
         """ returns Table """
-        if self.output is None:
+        if self._output is None:
             return None
 
         if self.data:
             self._generate_table()
 
-        assert isinstance(self.output, Table)
-        return self.output
+        assert isinstance(self._output, Table)
+        return self._output
 
     @property
     def rows(self):
         """ returns iterator for Groupby.rows """
-        if self.output is None:
+        if self._output is None:
             return None
 
         if self.data:
             self._generate_table()
 
-        assert isinstance(self.output, Table)
-        for row in self.output.rows:
+        assert isinstance(self._output, Table)
+        for row in self._output.rows:
             yield row
 
     def pivot(self, *args):
@@ -2159,30 +2365,30 @@ class GroupBy(object):
         if not all(isinstance(i, str) for i in args):
             raise TypeError(f"column name not str: {[i for i in columns if not isinstance(i,str)]}")
 
-        if self.output is None:
+        if self._output is None:
             return None
 
         if self.data:
             self._generate_table()
 
-        assert isinstance(self.output, Table)
-        if any(i not in self.output.columns for i in columns):
-            raise ValueError(f"column not found in groupby: {[i not in self.output.columns for i in columns]}")
+        assert isinstance(self._output, Table)
+        if any(i not in self._output.columns for i in columns):
+            raise ValueError(f"column not found in groupby: {[i not in self._output.columns for i in columns]}")
 
         sort_order = {k: False for k in self.keys}
-        if not self.output.is_sorted(**sort_order):
-            self.output.sort(**sort_order)
+        if not self._output.is_sorted(**sort_order):
+            self._output.sort(**sort_order)
 
         t = Table()
-        for col_name, col in self.output.columns.items():  # add vertical groups.
+        for col_name, col in self._output.columns.items():  # add vertical groups.
             if col_name in self.keys and col_name not in columns:
                 t.add_column(col_name, col.datatype, allow_empty=False)
 
         tup_length = 0
-        for column_key in self.output.filter(*columns):  # add horizontal groups.
+        for column_key in self._output.filter(*columns):  # add horizontal groups.
             col_name = ",".join(f"{h}={v}" for h, v in zip(columns, column_key))  # expressed "a=0,b=3" in column name "Sum(g, a=0,b=3)"
 
-            for (header, function), function_instances in zip(self.groupby_functions, self.function_classes):
+            for (header, function), function_instances in zip(self.groupby_functions, self._function_classes):
                 new_column_name = f"{function.__name__}({header},{col_name})"
                 if new_column_name not in t.columns:  # it's could be duplicate key value.
                     t.add_column(new_column_name, datatype=function_instances.datatype, allow_empty=True)
@@ -2191,16 +2397,16 @@ class GroupBy(object):
                     pass  # it's a duplicate.
 
         # add rows.
-        key_index = {k: i for i, k in enumerate(self.output.columns)}
+        key_index = {k: i for i, k in enumerate(self._output.columns)}
         old_v_keys = tuple(None for k in self.keys if k not in columns)
 
-        for row in self.output.rows:
+        for row in self._output.rows:
             v_keys = tuple(row[key_index[k]] for k in self.keys if k not in columns)
             if v_keys != old_v_keys:
                 t.add_row(v_keys + tuple(None for i in range(tup_length)))
                 old_v_keys = v_keys
 
-            function_values = [v for h, v in zip(self.output.columns, row) if h not in self.keys]
+            function_values = [v for h, v in zip(self._output.columns, row) if h not in self.keys]
 
             col_name = ",".join(f"{h}={row[key_index[h]]}" for h in columns)
             for (header, function), fi in zip(self.groupby_functions, function_values):
